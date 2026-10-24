@@ -9,7 +9,7 @@
 > [!IMPORTANT]
 > **Ports Launcher itself ships no game files, ROMs, ISOs, or any other copyrighted asset whatsoever.** Every catalog entry only ever installs the "recomp"/source-port *code* — an open-source build published by that project's own repository. Any original game data an entry needs is yours to supply, from your own legally-obtained copy; Ports Launcher never bundles, downloads, hosts, or links to that data anywhere.
 
-A lightweight library/installer for unofficial game ports: browse a catalog, install straight from a GitHub/GitLab release (or a direct download link), launch, and keep everything up to date from one window. Built with Rust and [Slint](https://slint.dev), with full keyboard *and* gamepad navigation throughout, and nothing to install separately (a minimal 7-Zip ships alongside the executable to extract port releases).
+A lightweight library/installer for unofficial game ports: browse a catalog, install straight from a GitHub/GitLab release (or a direct download link), launch, and keep everything up to date from one window. Built with Rust and [Slint](https://slint.dev), with full keyboard *and* gamepad navigation throughout, and nothing to install separately (port releases are extracted by the launcher itself: zip, tar.gz, 7z, rar and NSIS installers).
 
 ## Features
 
@@ -88,8 +88,9 @@ Open it from the **◯** button in the title bar — a menu with **Themes**, **L
 
 A couple of external tools come up repeatedly in `ports.json`'s **Required files** instructions, for preparing your own game data before pointing a port at it:
 
-- **[7-Zip](https://github.com/ip7z/7zip)** — a minimal, command-line-only copy ships with Ports Launcher, but only to extract port release archives internally; get the regular version separately to handle archives as needed.
+- **[7-Zip](https://github.com/ip7z/7zip)** — not bundled, get it separately: for handling archives while preparing your own game files (Ports Launcher extracts port releases on its own).
 - **[extract-xiso](https://github.com/XboxDev/extract-xiso)** — not bundled, get it separately: for extracting the assets from your own Xbox/Xbox 360 dumps.
+- **[SilentCMD](https://github.com/stbrenner/SilentCMD)** — not bundled, get it separately: runs a `.bat` launcher without flashing a console window.
 
 ## Configuration
 

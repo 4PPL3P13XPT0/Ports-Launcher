@@ -35,7 +35,7 @@ curl -fL -o "$ARCHIVE" "$REPO/releases/latest/download/Ports.Launcher.Linux.tar.
 
 echo "Installing..."
 tar -xf "$ARCHIVE" -C "$EXTRACT_TO" --exclude="Ports Launcher/$SELF" || fail "Extraction failed."
-chmod +x "$INSTALL_DIR/ports_launcher" "$INSTALL_DIR/7zzs" 2>/dev/null
+chmod +x "$INSTALL_DIR/ports_launcher" 2>/dev/null
 NEW_SELF="$INSTALL_DIR/.$SELF.new"
 tar -xOf "$ARCHIVE" "Ports Launcher/$SELF" > "$NEW_SELF" 2>/dev/null
 

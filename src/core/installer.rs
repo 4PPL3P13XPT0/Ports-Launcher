@@ -6,9 +6,8 @@ use super::platform_resolve::{resolve_per_platform, resolve_preferred_asset};
 use super::save_backup;
 use super::{github_api, gitlab_api};
 use serde_json::Value;
-use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -187,7 +186,7 @@ fn merge_into(src: &Path, dest: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+pub(crate) fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in fs::read_dir(dir)?.filter_map(|e| e.ok()) {
         if entry.file_type()?.is_dir() {
             collect_files(&entry.path(), out)?;
@@ -198,69 +197,97 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-const SEVENZIP_NAME: &str = "7z.exe";
-#[cfg(target_os = "linux")]
-const SEVENZIP_NAME: &str = "7zzs";
-
-pub(crate) fn sevenzip_exe_path() -> Option<PathBuf> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    [dir.join(SEVENZIP_NAME), dir.parent()?.join(SEVENZIP_NAME)].into_iter().find(|p| p.is_file())
+fn archive_err(e: impl std::fmt::Display) -> InstallError {
+    InstallError::Message(format!("Couldn't extract this archive: {e}"))
 }
 
-pub(crate) fn run_7z(tool: &Path, args: &[&OsStr], action: &str, cwd: Option<&Path>) -> Result<std::process::Output, String> {
-    let mut cmd = std::process::Command::new(tool);
-    cmd.arg("-sccUTF-8").args(args).stdin(std::process::Stdio::null());
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let output = cmd.output().map_err(|e| e.to_string())?;
-    if output.status.code().is_none_or(|c| c >= 2) {
-        return Err(format!("7-Zip failed to {action} this archive: {}", seven_zip_error(&output.stdout, &output.stderr)));
-    }
-    Ok(output)
-}
-
-fn seven_zip_error(stdout: &[u8], stderr: &[u8]) -> String {
-    String::from_utf8_lossy(stderr)
-        .lines()
-        .chain(String::from_utf8_lossy(stdout).lines())
-        .find(|l| l.contains("ERROR"))
-        .map(str::trim)
-        .unwrap_or("unknown error")
-        .to_string()
-}
-
-fn extract_archive_via_7z(archive: &Path, staging: &Path, max_uncompressed_size: u64) -> Result<(), InstallError> {
-    let tool = sevenzip_exe_path()
-        .ok_or_else(|| InstallError::Message("7-Zip is required next to the application to extract this file (missing).".to_string()))?;
-
-    let listing = run_7z(&tool, &[OsStr::new("l"), OsStr::new("-slt"), archive.as_os_str()], "read", None).install_err()?;
-    let text = String::from_utf8_lossy(&listing.stdout);
-    let kind = text.lines().find_map(|l| l.strip_prefix("Type = ")).unwrap_or("").trim().to_string();
-    let total: u64 = text.lines().filter_map(|l| l.strip_prefix("Size = ")).filter_map(|n| n.trim().parse::<u64>().ok()).sum();
-    reject_if_too_large(total, max_uncompressed_size)?;
-
-    let out_arg = format!("-o{}", staging.display());
-    let run_extract = |source: &Path, extra: Option<&str>| {
-        let mut args = vec![OsStr::new("x"), source.as_os_str(), OsStr::new(&out_arg), OsStr::new("-y"), OsStr::new("-bd")];
-        args.extend(extra.map(OsStr::new));
-        run_7z(&tool, &args, "extract", None).install_err()
-    };
-    let nsis_exclusion = kind.eq_ignore_ascii_case("Nsis").then_some("-x!$PLUGINSDIR\\*");
-    run_extract(archive, nsis_exclusion)?;
-
-    if kind.eq_ignore_ascii_case("gzip") {
-        if let Some(inner) = fs::read_dir(staging).install_err()?.filter_map(|e| e.ok()).map(|e| e.path()).next() {
-            run_extract(&inner, None)?;
-            with_path(retry_transient(|| fs::remove_file(&inner)), &inner).install_err()?;
+/// Picks the format from the file's magic bytes, not its extension.
+fn extract_archive(archive: &Path, staging: &Path, max_uncompressed_size: u64) -> Result<(), InstallError> {
+    let mut file = with_path(fs::File::open(archive), archive).install_err()?;
+    let mut magic = [0u8; 6];
+    let len = file.read(&mut magic).install_err()?;
+    file.rewind().install_err()?;
+    match &magic[..len] {
+        [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C] => extract_7z(archive, staging, max_uncompressed_size),
+        [b'R', b'a', b'r', b'!', ..] => extract_rar(archive, staging, max_uncompressed_size),
+        [0x1F, 0x8B, ..] => extract_tar(flate2::read::MultiGzDecoder::new(file), staging, max_uncompressed_size),
+        // An .exe is a zip with a stub in front (zip-disguised-as-exe), an NSIS installer or a WinRAR SFX.
+        [b'M', b'Z', ..] => {
+            if let Ok(zip) = zip::ZipArchive::new(file) {
+                return extract_zip(zip, staging, max_uncompressed_size);
+            }
+            let data = with_path(fs::read(archive), archive).install_err()?;
+            match nsis::NsisInstaller::builder(&data).max_decompressed_size(usize::try_from(max_uncompressed_size).unwrap_or(usize::MAX)).parse() {
+                Ok(installer) => extract_nsis(&installer, staging, max_uncompressed_size),
+                Err(_) => extract_rar(archive, staging, max_uncompressed_size),
+            }
         }
+        [b'P', b'K', ..] => extract_zip(zip::ZipArchive::new(file).map_err(archive_err)?, staging, max_uncompressed_size),
+        _ => extract_tar(file, staging, max_uncompressed_size),
+    }
+}
+
+fn extract_zip(mut zip: zip::ZipArchive<fs::File>, staging: &Path, max_uncompressed_size: u64) -> Result<(), InstallError> {
+    let mut total = 0u64;
+    for i in 0..zip.len() {
+        total = total.saturating_add(zip.by_index_raw(i).map_err(archive_err)?.size());
+    }
+    reject_if_too_large(total, max_uncompressed_size)?;
+    zip.extract(staging).map_err(archive_err)
+}
+
+fn extract_tar(reader: impl Read, staging: &Path, max_uncompressed_size: u64) -> Result<(), InstallError> {
+    let mut tar = tar::Archive::new(reader);
+    let mut total = 0u64;
+    for entry in tar.entries().map_err(archive_err)? {
+        let mut entry = entry.map_err(archive_err)?;
+        total = total.saturating_add(entry.size());
+        reject_if_too_large(total, max_uncompressed_size)?;
+        entry.unpack_in(staging).map_err(archive_err)?;
+    }
+    Ok(())
+}
+
+fn extract_7z(archive: &Path, staging: &Path, max_uncompressed_size: u64) -> Result<(), InstallError> {
+    let listing = sevenz_rust2::Archive::open(archive).map_err(archive_err)?;
+    reject_if_too_large(listing.files.iter().fold(0u64, |sum, f| sum.saturating_add(f.size)), max_uncompressed_size)?;
+    sevenz_rust2::decompress_file(archive, staging).map_err(archive_err)
+}
+
+fn extract_rar(archive: &Path, staging: &Path, max_uncompressed_size: u64) -> Result<(), InstallError> {
+    let rar = rars::ArchiveReader::read_path(archive).map_err(archive_err)?;
+    reject_if_too_large(rar.members().fold(0u64, |sum, m| sum.saturating_add(m.meta.unpacked_size)), max_uncompressed_size)?;
+    rar.extract_to(None, |entry| {
+        let dest = staging.join(rars::entry_relative_path(entry.name_bytes())?);
+        if entry.is_directory {
+            fs::create_dir_all(&dest)?;
+            return Ok(Box::new(io::sink()));
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Ok(Box::new(fs::File::create(&dest)?))
+    })
+    .map_err(archive_err)
+}
+
+fn extract_nsis(installer: &nsis::NsisInstaller, staging: &Path, max_uncompressed_size: u64) -> Result<(), InstallError> {
+    let mut total = 0u64;
+    for file in installer.files() {
+        let file = file.map_err(archive_err)?;
+        // to_path() is sanitised for joining and maps $INSTDIR to the root and $PLUGINSDIR to "_plugins".
+        let rel = file.dest_path().map_err(archive_err)?.to_path();
+        if rel.is_empty() || rel.starts_with("_plugins/") {
+            continue;
+        }
+        let content = file.decompress().map_err(archive_err)?;
+        total = total.saturating_add(content.len() as u64);
+        reject_if_too_large(total, max_uncompressed_size)?;
+        let dest = staging.join(&rel);
+        if let Some(parent) = dest.parent() {
+            with_path(fs::create_dir_all(parent), parent).install_err()?;
+        }
+        with_path(fs::write(&dest, content), &dest).install_err()?;
     }
     Ok(())
 }
@@ -324,7 +351,7 @@ fn extract_to_staging(archive: &Path, staging: &Path, exe_is_archive: Option<&st
         with_path(retry_transient(|| fs::copy(archive, &dest)), &dest).install_err()?;
         return Ok(staging.to_path_buf());
     }
-    extract_archive_via_7z(archive, staging, MAX_UNCOMPRESSED_SIZE)?;
+    extract_archive(archive, staging, MAX_UNCOMPRESSED_SIZE)?;
     with_path(clear_readonly_recursive(staging), staging).install_err()?;
     match exe_is_archive {
         Some(target) => find_exe_folder(staging, target),
@@ -570,79 +597,120 @@ mod tests {
         assert_eq!(safe_download_name(".."), "download");
     }
 
-    fn build_archive(kind: &str, files: &[(&str, &[u8])], archive_path: &Path) {
+    fn build_zip(files: &[(&str, &[u8])], archive_path: &Path) {
+        let mut zip = zip::ZipWriter::new(fs::File::create(archive_path).unwrap());
+        for (name, content) in files {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            io::Write::write_all(&mut zip, content).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn build_tar_gz(files: &[(&str, &[u8])], archive_path: &Path) {
+        let gz = flate2::write::GzEncoder::new(fs::File::create(archive_path).unwrap(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        for (name, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, *content).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+
+    fn build_7z(files: &[(&str, &[u8])], archive_path: &Path) {
         let src = archive_path.parent().unwrap().join("_src");
         let _ = fs::remove_dir_all(&src);
-        fs::create_dir_all(&src).unwrap();
         for (rel_path, content) in files {
             let path = src.join(rel_path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, content).unwrap();
         }
-        let tool = sevenzip_exe_path().expect("7-Zip introuvable, requis par les tests");
-        let output =
-            std::process::Command::new(&tool).current_dir(&src).arg("a").arg(format!("-t{kind}")).arg(archive_path).arg(".").output().unwrap();
-        assert!(output.status.success(), "échec de création de l'archive ({kind}) : {}", String::from_utf8_lossy(&output.stdout));
+        sevenz_rust2::compress_to_path(&src, archive_path).unwrap();
         fs::remove_dir_all(&src).unwrap();
     }
 
-    fn build_tar_gz_archive(files: &[(&str, &[u8])], archive_path: &Path) {
-        let tar_path = archive_path.with_extension("");
-        build_archive("tar", files, &tar_path);
-        let tool = sevenzip_exe_path().unwrap();
-        let output = std::process::Command::new(&tool).arg("a").arg("-tgzip").arg(archive_path).arg(&tar_path).output().unwrap();
-        assert!(output.status.success());
-        fs::remove_file(&tar_path).unwrap();
-    }
-
     #[test]
-    fn extract_archive_via_7z_rejette_une_archive_trop_grosse() {
+    fn extract_archive_rejette_une_archive_trop_grosse() {
         let dir = temp_dir("zipbomb");
         let archive_path = dir.join("bomb.zip");
-        build_archive("zip", &[("a.txt", b"hello world")], &archive_path);
+        build_zip(&[("a.txt", b"hello world")], &archive_path);
         let staging = dir.join("staging");
         fs::create_dir_all(&staging).unwrap();
-        assert!(extract_archive_via_7z(&archive_path, &staging, 0).is_err());
+        assert!(extract_archive(&archive_path, &staging, 0).is_err());
     }
 
     #[test]
-    fn extract_archive_via_7z_extrait_un_zip() {
+    fn extract_archive_extrait_un_zip() {
         let dir = temp_dir("zipok");
         let archive_path = dir.join("ok.zip");
-        build_archive("zip", &[("sub/a.txt", b"hello world")], &archive_path);
+        build_zip(&[("sub/a.txt", b"hello world")], &archive_path);
         let staging = dir.join("staging");
         fs::create_dir_all(&staging).unwrap();
-        extract_archive_via_7z(&archive_path, &staging, MAX_UNCOMPRESSED_SIZE).unwrap();
+        extract_archive(&archive_path, &staging, MAX_UNCOMPRESSED_SIZE).unwrap();
         assert_eq!(fs::read_to_string(staging.join("sub").join("a.txt")).unwrap(), "hello world");
     }
 
     #[test]
-    fn extract_archive_via_7z_extrait_un_tar_gz() {
+    fn extract_archive_extrait_un_tar_gz() {
         let dir = temp_dir("targz");
         let archive_path = dir.join("ok.tar.gz");
-        build_tar_gz_archive(&[("sub/a.txt", b"hello world")], &archive_path);
+        build_tar_gz(&[("sub/a.txt", b"hello world")], &archive_path);
         let staging = dir.join("staging");
         fs::create_dir_all(&staging).unwrap();
-        extract_archive_via_7z(&archive_path, &staging, MAX_UNCOMPRESSED_SIZE).unwrap();
+        extract_archive(&archive_path, &staging, MAX_UNCOMPRESSED_SIZE).unwrap();
         assert_eq!(fs::read_to_string(staging.join("sub").join("a.txt")).unwrap(), "hello world");
     }
 
     #[test]
-    fn extract_archive_via_7z_extrait_un_7z() {
-        let dir = temp_dir("sevenz");
-        let archive_path = dir.join("ok.7z");
-        build_archive("7z", &[("sub/a.txt", b"hello world")], &archive_path);
+    fn extract_archive_rejette_un_tar_gz_trop_gros() {
+        let dir = temp_dir("targz_bomb");
+        let archive_path = dir.join("bomb.tar.gz");
+        build_tar_gz(&[("a.txt", b"hello world")], &archive_path);
         let staging = dir.join("staging");
         fs::create_dir_all(&staging).unwrap();
-        extract_archive_via_7z(&archive_path, &staging, MAX_UNCOMPRESSED_SIZE).unwrap();
+        assert!(extract_archive(&archive_path, &staging, 0).is_err());
+    }
+
+    #[test]
+    fn extract_archive_extrait_un_7z() {
+        let dir = temp_dir("sevenz");
+        let archive_path = dir.join("ok.7z");
+        build_7z(&[("sub/a.txt", b"hello world")], &archive_path);
+        let staging = dir.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        extract_archive(&archive_path, &staging, MAX_UNCOMPRESSED_SIZE).unwrap();
         assert_eq!(fs::read_to_string(staging.join("sub").join("a.txt")).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn extract_archive_rejette_un_7z_trop_gros() {
+        let dir = temp_dir("sevenz_bomb");
+        let archive_path = dir.join("bomb.7z");
+        build_7z(&[("a.txt", b"hello world")], &archive_path);
+        let staging = dir.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        assert!(extract_archive(&archive_path, &staging, 0).is_err());
+    }
+
+    #[test]
+    fn extract_archive_extrait_un_zip_precede_d_un_stub_exe() {
+        let dir = temp_dir("zip_sfx");
+        let zip_path = dir.join("payload.zip");
+        build_zip(&[("bin/game.exe", b"the-game")], &zip_path);
+        let archive_path = dir.join("Setup.exe");
+        fs::write(&archive_path, [b"MZ-fake-stub".as_slice(), &fs::read(&zip_path).unwrap()[..]].concat()).unwrap();
+        let staging = dir.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        extract_archive(&archive_path, &staging, MAX_UNCOMPRESSED_SIZE).unwrap();
+        assert_eq!(fs::read_to_string(staging.join("bin").join("game.exe")).unwrap(), "the-game");
     }
 
     fn build_fake_exe_archive(path: &Path, exe_folder: &str) {
         let exe_path = format!("{exe_folder}/game.exe");
         let dll_path = format!("{exe_folder}/game.dll");
-        build_archive(
-            "zip",
+        build_zip(
             &[("_rels/.rels", b"<Relationships/>".as_slice()), ("[Content_Types].xml", b"<Types/>".as_slice()), (&exe_path, b"fake-exe".as_slice()), (&dll_path, b"fake-dll".as_slice())],
             path,
         );
@@ -668,7 +736,7 @@ mod tests {
     fn extract_exe_is_archive_echoue_si_l_ancre_matche_plusieurs_fichiers() {
         let dir = temp_dir("exe_archive_ambiguous");
         let archive_path = dir.join("Install.exe");
-        build_archive("zip", &[("win64/game.exe", b"a".as_slice()), ("win32/game.exe", b"b".as_slice())], &archive_path);
+        build_zip(&[("win64/game.exe", b"a".as_slice()), ("win32/game.exe", b"b".as_slice())], &archive_path);
         let dest_dir = dir.join("dest");
         assert!(extract(&archive_path, &dest_dir, &dir, Some("game.exe"), &mut no_progress).is_err());
     }
@@ -677,7 +745,7 @@ mod tests {
     fn extract_exe_is_archive_ancre_leve_l_ambiguite() {
         let dir = temp_dir("exe_archive_base_exe");
         let archive_path = dir.join("Install.exe");
-        build_archive("zip", &[("redist/vc_redist.x64.exe", b"redist".as_slice()), ("bin/game.exe", b"the-game".as_slice())], &archive_path);
+        build_zip(&[("redist/vc_redist.x64.exe", b"redist".as_slice()), ("bin/game.exe", b"the-game".as_slice())], &archive_path);
 
         let dest_dir = dir.join("dest");
         extract(&archive_path, &dest_dir, &dir, Some("game.exe"), &mut no_progress).unwrap();
@@ -697,10 +765,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_route_un_rar_vers_7z_plutot_que_de_le_copier() {
-        let dir = temp_dir("rar_routed_to_7z");
+    fn extract_route_un_rar_vers_l_extraction_plutot_que_de_le_copier() {
+        let dir = temp_dir("rar_routed_to_extraction");
         let archive_path = dir.join("release.rar");
-        fs::write(&archive_path, b"not a real rar file").unwrap();
+        fs::write(&archive_path, b"Rar!\x1a\x07\x01\x00not a real rar file").unwrap();
         let dest_dir = dir.join("dest");
         assert!(extract(&archive_path, &dest_dir, &dir, None, &mut no_progress).is_err());
         assert!(!dest_dir.join("release.rar").exists());
@@ -779,17 +847,12 @@ mod tests {
     #[test]
     fn extract_leve_l_attribut_lecture_seule_herite_de_l_archive() {
         let dir = temp_dir("readonly_archive");
-        let src = dir.join("_src");
-        fs::create_dir_all(src.join("Wrapper")).unwrap();
-        fs::write(src.join("Wrapper").join("game.exe"), b"fake-exe").unwrap();
-        let mut perms = fs::metadata(src.join("Wrapper")).unwrap().permissions();
-        perms.set_readonly(true);
-        fs::set_permissions(src.join("Wrapper"), perms).unwrap();
-
         let archive_path = dir.join("readonly.zip");
-        let tool = sevenzip_exe_path().expect("7-Zip introuvable, requis par les tests");
-        let output = std::process::Command::new(&tool).current_dir(&src).arg("a").arg("-tzip").arg(&archive_path).arg(".").output().unwrap();
-        assert!(output.status.success());
+        let mut zip = zip::ZipWriter::new(fs::File::create(&archive_path).unwrap());
+        zip.add_directory("Wrapper/", zip::write::SimpleFileOptions::default().unix_permissions(0o555)).unwrap();
+        zip.start_file("Wrapper/game.exe", zip::write::SimpleFileOptions::default()).unwrap();
+        io::Write::write_all(&mut zip, b"fake-exe").unwrap();
+        zip.finish().unwrap();
 
         let dest_dir = dir.join("dest");
         extract(&archive_path, &dest_dir, &dir, None, &mut no_progress).unwrap();
@@ -910,7 +973,7 @@ mod tests {
             .collect();
         entries.push((format!("{wrapper}/game.exe"), b"fake-exe".to_vec()));
         let files: Vec<(&str, &[u8])> = entries.iter().map(|(p, c)| (p.as_str(), c.as_slice())).collect();
-        build_archive("zip", &files, path);
+        build_zip(&files, path);
     }
 
     #[test]

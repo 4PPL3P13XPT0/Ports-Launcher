@@ -9,7 +9,7 @@
 > [!IMPORTANT]
 > **Ports Launcher lui-même ne distribue aucun fichier de jeu, ROM, ISO, ni aucun autre asset protégé par le droit d'auteur.** Chaque entrée du catalogue n'installe jamais que le *code* du recomp/source-port — un build open-source publié par le dépôt du projet lui-même. Toute donnée originale de jeu nécessaire reste à fournir toi-même, depuis ta propre copie acquise légalement ; Ports Launcher n'embarque, ne télécharge, n'héberge et ne renvoie jamais vers ces données, nulle part.
 
-Une bibliothèque/installateur léger pour les portages de jeux non-officiels : parcours un catalogue, installe directement depuis une release GitHub/GitLab (ou un lien de téléchargement direct), lance, et garde tout à jour depuis une seule fenêtre. Écrit en Rust et [Slint](https://slint.dev), entièrement navigable au clavier *et* à la manette, rien à installer séparément (un 7-Zip minimal est fourni à côté de l'exécutable pour extraire les releases des ports).
+Une bibliothèque/installateur léger pour les portages de jeux non-officiels : parcours un catalogue, installe directement depuis une release GitHub/GitLab (ou un lien de téléchargement direct), lance, et garde tout à jour depuis une seule fenêtre. Écrit en Rust et [Slint](https://slint.dev), entièrement navigable au clavier *et* à la manette, rien à installer séparément (les releases des ports sont extraites par le launcher lui-même : zip, tar.gz, 7z, rar et installeurs NSIS).
 
 ## Fonctionnalités
 
@@ -88,8 +88,9 @@ Ouvre-le depuis le bouton **◯** de la barre de titre — un menu avec **Thème
 
 Deux outils externes reviennent régulièrement dans les instructions **Required files** de `ports.json`, pour préparer tes propres données de jeu avant de les pointer vers un port :
 
-- **[7-Zip](https://github.com/ip7z/7zip)** — une version minimale (ligne de commande) est fournie avec Ports Launcher, mais uniquement pour extraire en interne les releases des ports ; récupère la version classique séparément pour gérer des archives au besoin.
+- **[7-Zip](https://github.com/ip7z/7zip)** — pas fourni avec Ports Launcher, à récupérer séparément : pour gérer des archives en préparant tes propres fichiers de jeu (Ports Launcher extrait lui-même les releases des ports).
 - **[extract-xiso](https://github.com/XboxDev/extract-xiso)** — pas fourni avec Ports Launcher, à récupérer séparément : sert à extraire les assets de tes dumps Xbox/Xbox 360 que tu possèdes.
+- **[SilentCMD](https://github.com/stbrenner/SilentCMD)** — pas fourni avec Ports Launcher, à récupérer séparément : lance un `.bat` sans faire apparaître de fenêtre de console.
 
 ## Configuration
 

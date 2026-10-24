@@ -1,10 +1,9 @@
 
-use super::installer::{run_7z, sevenzip_exe_path};
+use super::installer::collect_files;
 use super::models::Port;
 use super::path_safety::{is_within, safe_join};
 use super::platform_resolve::resolve_save_folder;
 use serde_json::Value;
-use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -103,13 +102,19 @@ pub struct GlobalBackupSummary {
     pub failed: usize,
 }
 
-fn zip_staging_dir(staging: &Path, zip_path: &Path) -> Result<(), String> {
-    let tool = sevenzip_exe_path().ok_or("7-Zip is required next to the application to create this backup (missing).")?;
+fn zip_staging_dir(staging: &Path, zip_path: &Path) -> zip::result::ZipResult<()> {
     if let Some(parent) = zip_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent)?;
     }
-    let _ = fs::remove_file(zip_path);
-    run_7z(&tool, &[OsStr::new("a"), OsStr::new("-tzip"), zip_path.as_os_str(), OsStr::new(".")], "create", Some(staging))?;
+    let mut files = Vec::new();
+    collect_files(staging, &mut files)?;
+    let mut zip = zip::ZipWriter::new(fs::File::create(zip_path)?);
+    for file in files {
+        let name = file.strip_prefix(staging).unwrap_or(&file).to_string_lossy().replace('\\', "/");
+        zip.start_file(name, zip::write::SimpleFileOptions::default())?;
+        io::copy(&mut fs::File::open(&file)?, &mut zip)?;
+    }
+    zip.finish()?;
     Ok(())
 }
 
@@ -307,8 +312,8 @@ mod tests {
 
         assert_eq!(summary, GlobalBackupSummary { copied: 1, skipped: 1, failed: 0 });
         let zip_path = saves_backup_dir.join(GLOBAL_BACKUPS_DIR).join("2026-08-23.zip");
-        assert_eq!(read_zip_entry(&zip_path, "MyGame/save_folder/game.sav"), "precious");
-        assert!(!zip_path.with_extension("extracted").join("MyGame").join("save_folder").join("game.exe").exists());
+        assert_eq!(read_zip_entry(&zip_path, "MyGame/save_folder/game.sav").as_deref(), Some("precious"));
+        assert!(read_zip_entry(&zip_path, "MyGame/save_folder/game.exe").is_none());
     }
 
     #[test]
@@ -391,14 +396,10 @@ mod tests {
         assert!(!pending_restore_dir(&saves_backup_dir, "MyGame", "save_folder").exists());
     }
 
-    fn read_zip_entry(zip_path: &Path, entry_path: &str) -> String {
-        let tool = sevenzip_exe_path().unwrap();
-        let out_dir = zip_path.with_extension("extracted");
-        let _ = fs::remove_dir_all(&out_dir);
-        let out_arg = format!("-o{}", out_dir.display());
-        let output = std::process::Command::new(&tool).arg("x").arg(zip_path).arg(&out_arg).arg("-y").output().unwrap();
-        assert!(output.status.success(), "échec d'extraction du zip : {}", String::from_utf8_lossy(&output.stdout));
-        fs::read_to_string(out_dir.join(entry_path)).unwrap()
+    fn read_zip_entry(zip_path: &Path, entry_path: &str) -> Option<String> {
+        let mut zip = zip::ZipArchive::new(fs::File::open(zip_path).unwrap()).unwrap();
+        let entry = zip.by_name(entry_path).ok()?;
+        Some(io::read_to_string(entry).unwrap())
     }
 
     #[test]
@@ -418,7 +419,7 @@ mod tests {
         assert_eq!(seen, vec!["MyGame".to_string()]);
         assert_eq!(summary, GlobalBackupSummary { copied: 1, skipped: 1, failed: 0 });
         let zip_path = saves_backup_dir.join(GLOBAL_BACKUPS_DIR).join("2026-08-23.zip");
-        assert_eq!(read_zip_entry(&zip_path, "MyGame/save_folder/slot1.dat"), "precious");
+        assert_eq!(read_zip_entry(&zip_path, "MyGame/save_folder/slot1.dat").as_deref(), Some("precious"));
     }
 
     #[test]
@@ -435,7 +436,7 @@ mod tests {
 
         assert_eq!(summary, GlobalBackupSummary { copied: 1, skipped: 1, failed: 0 });
         let zip_path = saves_backup_dir.join(GLOBAL_BACKUPS_DIR).join("2026-08-23.zip");
-        assert_eq!(read_zip_entry(&zip_path, "MyGame/save_folder2/slot1.dat"), "precious");
+        assert_eq!(read_zip_entry(&zip_path, "MyGame/save_folder2/slot1.dat").as_deref(), Some("precious"));
     }
 
     #[test]
@@ -458,7 +459,7 @@ mod tests {
         run_global_backup(&[port_b], &library_dir, &saves_backup_dir, "2026-08-23", &mut |_| {});
 
         let zip_path = saves_backup_dir.join(GLOBAL_BACKUPS_DIR).join("2026-08-23.zip");
-        assert_eq!(read_zip_entry(&zip_path, "GameB/save_folder/slot1.dat"), "b");
-        assert!(!zip_path.with_extension("extracted").join("GameA").exists());
+        assert_eq!(read_zip_entry(&zip_path, "GameB/save_folder/slot1.dat").as_deref(), Some("b"));
+        assert!(read_zip_entry(&zip_path, "GameA/save_folder/slot1.dat").is_none());
     }
 }

@@ -16,11 +16,22 @@ raw-window-handle = "0.6"
 # preserve_order : les valeurs par plateforme se replient sur la première clé déclarée.
 serde_json = { version = "1", features = ["preserve_order"] }
 ureq = { version = "3", features = ["json"] }
-# Jaquettes et icône uniquement ; les archives sont extraites par 7-Zip.
+# Jaquettes et icône uniquement.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 chrono = "0.4"
 tempfile = "3"
 discord-rich-presence = "1"
+# Extraction des releases et sauvegardes, en Rust pur : zip, tar(.gz), 7z, rar, installeurs NSIS.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "bzip2", "lzma"] }
+tar = "0.4"
+flate2 = "1"
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["util", "bzip2", "ppmd", "deflate"] }
+rars = { version = "0.12", default-features = false }
+nsis = "0.6"
+
+[dev-dependencies]
+# Création d'archives 7z pour les tests.
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["util", "compress"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # XInput reconnaît plus de manettes et d'émulateurs que Windows.Gaming.Input.
